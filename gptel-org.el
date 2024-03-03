@@ -3,7 +3,7 @@
 ;; Copyright (C) 2024  Karthik Chikmagalur
 
 ;; Author: Karthik Chikmagalur <karthikchikmagalur@gmail.com>
-;; Keywords: 
+;; Keywords:
 
 ;; This program is free software; you can redistribute it and/or modify
 ;; it under the terms of the GNU General Public License as published by
@@ -20,13 +20,26 @@
 
 ;;; Commentary:
 
-;; 
+;;
 
 ;;; Code:
 (eval-when-compile (require 'cl-lib))
 (require 'org-element)
 (require 'outline)
 
+(declare-function org-element-begin "org-element")
+(declare-function org-element-lineage-map "org-element-ast")
+
+;; Functions used for saving/restoring gptel state in Org buffers
+(defvar org-entry-property-inherited-from)
+(declare-function org-entry-get "org")
+(declare-function org-entry-put "org")
+(declare-function org-with-wide-buffer "org-macs")
+(declare-function org-set-property "org")
+(declare-function org-property-values "org")
+(declare-function org-open-line "org")
+(declare-function org-at-heading-p "org")
+(declare-function org-get-heading "org")
 (declare-function org-at-heading-p "org")
 
 
@@ -118,7 +131,7 @@ value of `gptel-org-branching-context', which see."
   (unless prompt-end (setq prompt-end (point)))
   (let ((max-entries (and gptel--num-messages-to-send
                           (* 2 gptel--num-messages-to-send)))
-        (topic-start (gptel--get-topic-start)))
+        (topic-start (gptel-org--get-topic-start)))
     (when topic-start
       ;; narrow to GPTEL_TOPIC property scope
       (narrow-to-region topic-start prompt-end))
@@ -181,14 +194,6 @@ value of `gptel-org-branching-context', which see."
     (when tokens (setq tokens (gptel--numberize tokens)))
     (list system backend model temperature tokens)))
 
-  ;; (pcase-let ((`(,gptel--system-message ,gptel-backend
-  ;;                ,gptel-model ,gptel-temperature)
-  ;;              (if (derived-mode-p 'org-mode)
-  ;;                  (progn (require 'gptel-org)
-  ;;                         (gptel-org--entry-properties))
-  ;;                `(,gptel--system-message ,gptel-backend
-  ;;                  ,gptel-model ,gptel-temperature)))))
-  
 (defun gptel-org--restore-state ()
   "Restore gptel state for Org buffers when turning on `gptel-mode'."
   (save-restriction
@@ -260,7 +265,121 @@ non-nil (default), display a message afterwards."
                             (> attempts 0))
                    (funcall write-bounds (1- attempts)))))))
      (funcall write-bounds 6))))
-                                
+
+
+;;; Transforming responses
+(defun gptel--convert-markdown->org (str)
+  "Convert string STR from markdown to org markup.
+
+This is a very basic converter that handles only a few markup
+elements."
+  (interactive)
+  (with-temp-buffer
+    (insert str)
+    (goto-char (point-min))
+    (while (re-search-forward "`\\|\\*\\{1,2\\}\\|_" nil t)
+      (pcase (match-string 0)
+        ("`" (if (looking-at "``")
+                 (progn (backward-char)
+                        (delete-char 3)
+                        (insert "#+begin_src ")
+                        (when (re-search-forward "^```" nil t)
+                          (replace-match "#+end_src")))
+               (replace-match "=")))
+        ("**" (cond
+               ((looking-at "\\*\\(?:[[:word:]]\\|\s\\)")
+                (delete-char 1))
+               ((looking-back "\\(?:[[:word:]]\\|\s\\)\\*\\{2\\}"
+                              (max (- (point) 3) (point-min)))
+                (delete-char -1))))
+        ("*"
+         (cond
+          ((save-match-data
+             (and (looking-back "\\(?:[[:space:]]\\|\s\\)\\(?:_\\|\\*\\)"
+                                (max (- (point) 2) (point-min)))
+                  (not (looking-at "[[:space:]]\\|\s"))))
+           ;; Possible beginning of emphasis
+           (and
+            (save-excursion
+              (when (and (re-search-forward (regexp-quote (match-string 0))
+                                            (line-end-position) t)
+                         (looking-at "[[:space]]\\|\s")
+                         (not (looking-back "\\(?:[[:space]]\\|\s\\)\\(?:_\\|\\*\\)"
+                                            (max (- (point) 2) (point-min)))))
+                (delete-char -1) (insert "/") t))
+            (progn (delete-char -1) (insert "/"))))
+          ((save-excursion
+             (ignore-errors (backward-char 2))
+             (looking-at "\\(?:$\\|\\`\\)\n\\*[[:space:]]"))
+           ;; Bullet point, replace with hyphen
+           (delete-char -1) (insert "-"))))))
+    (buffer-string)))
+
+(defun gptel--stream-convert-markdown->org ()
+  "Return a Markdown to Org converter.
+
+This function parses a stream of Markdown text to Org
+continuously when it is called with successive chunks of the
+text stream."
+  (letrec ((in-src-block nil)           ;explicit nil to address BUG #183
+           (temp-buf (generate-new-buffer-name "*gptel-temp*"))
+           (start-pt (make-marker))
+           (cleanup-fn
+            (lambda (&rest _)
+              (when (buffer-live-p (get-buffer temp-buf))
+                (set-marker start-pt nil)
+                (kill-buffer temp-buf))
+              (remove-hook 'gptel-post-response-functions cleanup-fn))))
+    (add-hook 'gptel-post-response-functions cleanup-fn)
+    (lambda (str)
+      (let ((noop-p))
+        (with-current-buffer (get-buffer-create temp-buf)
+          (save-excursion (goto-char (point-max))
+                          (insert str))
+          (when (marker-position start-pt) (goto-char start-pt))
+          (save-excursion
+            (while (re-search-forward "`\\|\\*\\{1,2\\}\\|_" nil t)
+              (pcase (match-string 0)
+                ("`"
+                 (cond
+                  ((looking-at "``")
+                   (backward-char 1)
+                   (delete-char 3)
+                   (if in-src-block
+                       (progn (insert "#+end_src")
+                              (setq in-src-block nil))
+                     (insert "#+begin_src ")
+                     (setq in-src-block t)))
+                  ((looking-at "`\\|$")
+                   (setq noop-p t)
+                   (set-marker start-pt (1- (point)))
+                   (unless (eobp) (forward-char 1)))
+                  ((not in-src-block) (replace-match "="))))
+                ((and "**" (guard (not in-src-block)))
+                 (cond
+                  ((looking-at "\\*\\(?:[[:word:]]\\|\s\\)")
+                   (delete-char 1))
+                  ((looking-back "\\(?:[[:word:]]\\|\s\\)\\*\\{2\\}"
+                                 (max (- (point) 3) (point-min)))
+                   (delete-char -1))))
+                ((and "*" (guard (not in-src-block)))
+                 (save-match-data
+                   (save-excursion
+                     (ignore-errors (backward-char 2))
+                     (cond
+                      ((or (looking-at
+                            "[^[:space:][:punct:]\n]\\(?:_\\|\\*\\)\\(?:[[:space:][:punct:]]\\|$\\)")
+                           (looking-at
+                            "\\(?:[[:space:][:punct:]]\\)\\(?:_\\|\\*\\)\\([^[:space:][:punct:]]\\|$\\)"))
+                       ;; Emphasis, replace with slashes
+                       (forward-char 2) (delete-char -1) (insert "/"))
+                      ((looking-at "\\(?:$\\|\\`\\)\n\\*[[:space:]]")
+                       ;; Bullet point, replace with hyphen
+                       (forward-char 2) (delete-char -1) (insert "-")))))))))
+          (if noop-p
+              (buffer-substring (point) start-pt)
+            (prog1 (buffer-substring (point) (point-max))
+                   (set-marker start-pt (point-max)))))))))
 
 (provide 'gptel-org)
 ;;; gptel-org.el ends here

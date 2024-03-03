@@ -108,21 +108,19 @@
 (declare-function markdown-mode "markdown-mode")
 (declare-function gptel-curl-get-response "gptel-curl")
 (declare-function gptel-menu "gptel-transient")
-(declare-function gptel-org--create-prompt "gptel-org")
 (declare-function pulse-momentary-highlight-region "pulse")
 
-;; Functions used for saving/restoring gptel state in Org buffers
-(defvar org-entry-property-inherited-from)
-(declare-function org-entry-get "org")
-(declare-function org-entry-put "org")
-(declare-function org-with-wide-buffer "org-macs")
-(declare-function org-set-property "org")
-(declare-function org-property-values "org")
-(declare-function org-open-line "org")
-(declare-function org-at-heading-p "org")
-(declare-function org-get-heading "org")
 (declare-function ediff-make-cloned-buffer "ediff-util")
 (declare-function ediff-regions-internal "ediff")
+
+(declare-function gptel-org--create-prompt "gptel-org")
+(declare-function gptel-org-set-topic "gptel-org")
+(declare-function gptel-org--save-state "gptel-org")
+(declare-function gptel-org--restore-state "gptel-org")
+(declare-function gptel--stream-convert-markdown->org "gptel-org")
+(declare-function gptel--convert-markdown->org "gptel-org")
+(define-obsolete-function-alias
+  'gptel-set-topic 'gptel-org-set-topic "0.7.5")
 
 (eval-when-compile
   (require 'subr-x)
@@ -632,9 +630,6 @@ Valid JSON unless NO-JSON is t."
 
 ;; Saving and restoring state
 
-(declare-function gptel-org--restore-state "gptel-org")
-(declare-function gptel-org--save-state "gptel-org")
-
 (defun gptel--restore-state ()
   "Restore gptel state when turning on `gptel-mode'."
   (when (buffer-file-name)
@@ -967,37 +962,6 @@ See `gptel--url-get-response' for details."
                  status-str (plist-get info :error)))
       (run-hook-with-args 'gptel-post-response-functions response-beg response-end))))
 
-(defun gptel-set-topic ()
-  "Set a topic and limit this conversation to the current heading.
-
-This limits the context sent to the LLM to the text between the
-current heading and the cursor position."
-  (interactive)
-  (pcase major-mode
-    ('org-mode
-     (org-set-property
-      "GPTEL_TOPIC"
-      (completing-read "Set topic as: "
-                       (org-property-values "GPTEL_TOPIC")
-                       nil nil (downcase
-                                (truncate-string-to-width
-                                 (substring-no-properties
-                                  (replace-regexp-in-string
-                                   "\\s-+" "-"
-                                   (org-get-heading)))
-                                 50)))))
-    ('markdown-mode
-     (message
-      "Support for multiple topics per buffer is not implemented for `markdown-mode'."))))
-
-(defun gptel--get-topic-start ()
-  "If a conversation topic is set, return it."
-  (pcase major-mode
-    ('org-mode
-     (when (org-entry-get (point) "GPTEL_TOPIC" 'inherit)
-         (marker-position org-entry-property-inherited-from)))
-    ('markdown-mode nil)))
-
 (defun gptel--create-prompt (&optional prompt-end)
   "Return a full conversation prompt from the contents of this buffer.
 
@@ -1237,119 +1201,6 @@ INTERACTIVEP is t when gptel is called interactively."
       (message "Send your query with %s!"
                (substitute-command-keys "\\[gptel-send]")))
     (current-buffer)))
-
-(defun gptel--convert-markdown->org (str)
-  "Convert string STR from markdown to org markup.
-
-This is a very basic converter that handles only a few markup
-elements."
-  (interactive)
-  (with-temp-buffer
-    (insert str)
-    (goto-char (point-min))
-    (while (re-search-forward "`\\|\\*\\{1,2\\}\\|_" nil t)
-      (pcase (match-string 0)
-        ("`" (if (looking-at "``")
-                 (progn (backward-char)
-                        (delete-char 3)
-                        (insert "#+begin_src ")
-                        (when (re-search-forward "^```" nil t)
-                          (replace-match "#+end_src")))
-               (replace-match "=")))
-        ("**" (cond
-               ((looking-at "\\*\\(?:[[:word:]]\\|\s\\)")
-                (delete-char 1))
-               ((looking-back "\\(?:[[:word:]]\\|\s\\)\\*\\{2\\}"
-                              (max (- (point) 3) (point-min)))
-                (delete-char -1))))
-        ("*"
-         (cond
-          ((save-match-data
-             (and (looking-back "\\(?:[[:space:]]\\|\s\\)\\(?:_\\|\\*\\)"
-                                (max (- (point) 2) (point-min)))
-                  (not (looking-at "[[:space:]]\\|\s"))))
-           ;; Possible beginning of emphasis
-           (and
-            (save-excursion
-              (when (and (re-search-forward (regexp-quote (match-string 0))
-                                            (line-end-position) t)
-                         (looking-at "[[:space]]\\|\s")
-                         (not (looking-back "\\(?:[[:space]]\\|\s\\)\\(?:_\\|\\*\\)"
-                                            (max (- (point) 2) (point-min)))))
-                (delete-char -1) (insert "/") t))
-            (progn (delete-char -1) (insert "/"))))
-          ((save-excursion
-             (ignore-errors (backward-char 2))
-             (looking-at "\\(?:$\\|\\`\\)\n\\*[[:space:]]"))
-           ;; Bullet point, replace with hyphen
-           (delete-char -1) (insert "-"))))))
-    (buffer-string)))
-
-(defun gptel--stream-convert-markdown->org ()
-  "Return a Markdown to Org converter.
-
-This function parses a stream of Markdown text to Org
-continuously when it is called with successive chunks of the
-text stream."
-  (letrec ((in-src-block nil)           ;explicit nil to address BUG #183
-           (temp-buf (generate-new-buffer-name "*gptel-temp*"))
-           (start-pt (make-marker))
-           (cleanup-fn
-            (lambda (&rest _)
-              (when (buffer-live-p (get-buffer temp-buf))
-                (set-marker start-pt nil)
-                (kill-buffer temp-buf))
-              (remove-hook 'gptel-post-response-functions cleanup-fn))))
-    (add-hook 'gptel-post-response-functions cleanup-fn)
-    (lambda (str)
-      (let ((noop-p))
-        (with-current-buffer (get-buffer-create temp-buf)
-          (save-excursion (goto-char (point-max))
-                          (insert str))
-          (when (marker-position start-pt) (goto-char start-pt))
-          (save-excursion
-            (while (re-search-forward "`\\|\\*\\{1,2\\}\\|_" nil t)
-              (pcase (match-string 0)
-                ("`"
-                 (cond
-                  ((looking-at "``")
-                   (backward-char 1)
-                   (delete-char 3)
-                   (if in-src-block
-                       (progn (insert "#+end_src")
-                              (setq in-src-block nil))
-                     (insert "#+begin_src ")
-                     (setq in-src-block t)))
-                  ((looking-at "`\\|$")
-                   (setq noop-p t)
-                   (set-marker start-pt (1- (point)))
-                   (unless (eobp) (forward-char 1)))
-                  ((not in-src-block) (replace-match "="))))
-                ((and "**" (guard (not in-src-block)))
-                 (cond
-                  ((looking-at "\\*\\(?:[[:word:]]\\|\s\\)")
-                   (delete-char 1))
-                  ((looking-back "\\(?:[[:word:]]\\|\s\\)\\*\\{2\\}"
-                                 (max (- (point) 3) (point-min)))
-                   (delete-char -1))))
-                ((and "*" (guard (not in-src-block)))
-                 (save-match-data
-                   (save-excursion
-                     (ignore-errors (backward-char 2))
-                     (cond
-                      ((or (looking-at
-                            "[^[:space:][:punct:]\n]\\(?:_\\|\\*\\)\\(?:[[:space:][:punct:]]\\|$\\)")
-                           (looking-at
-                            "\\(?:[[:space:][:punct:]]\\)\\(?:_\\|\\*\\)\\([^[:space:][:punct:]]\\|$\\)"))
-                       ;; Emphasis, replace with slashes
-                       (forward-char 2) (delete-char -1) (insert "/"))
-                      ((looking-at "\\(?:$\\|\\`\\)\n\\*[[:space:]]")
-                       ;; Bullet point, replace with hyphen
-                       (forward-char 2) (delete-char -1) (insert "-")))))))))
-          (if noop-p
-              (buffer-substring (point) start-pt)
-            (prog1 (buffer-substring (point) (point-max))
-                   (set-marker start-pt (point-max)))))))))
 
 
 ;; Response tweaking commands
